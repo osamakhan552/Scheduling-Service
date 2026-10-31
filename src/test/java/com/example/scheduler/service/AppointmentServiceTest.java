@@ -7,18 +7,23 @@ import com.example.scheduler.domain.AppointmentDetails;
 import com.example.scheduler.domain.AppointmentNotFoundException;
 import com.example.scheduler.domain.AppointmentStatus;
 import com.example.scheduler.domain.ConcurrentAppointmentModificationException;
+import com.example.scheduler.domain.InvalidAppointmentException;
 import com.example.scheduler.repository.AppointmentRepository;
+import org.hibernate.exception.ConstraintViolationException;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.SimpleTransactionStatus;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -30,183 +35,245 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
+/**
+ * Unit tests for {@link AppointmentService}.
+ *
+ * The {@link PlatformTransactionManager} is mocked to execute lambdas
+ * synchronously so no database is needed.  Overlap logic is tested both
+ * via the early hasActiveOverlap guard and via the exclusion-constraint
+ * exception path that catches concurrent race conditions.
+ */
 @ExtendWith(MockitoExtension.class)
 class AppointmentServiceTest {
 
     @Mock private AppointmentRepository repository;
-    @Mock private PlatformTransactionManager transactionManager;
+    @Mock private PlatformTransactionManager txManager;
 
-    private final Clock fixedClock = Clock.fixed(Instant.parse("2026-10-31T06:00:00Z"), ZoneOffset.UTC);
-    private final AppointmentInputValidator validator = new AppointmentInputValidator();
+    private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-31T06:00:00Z"), ZoneOffset.UTC);
+    private static final String PROVIDER = "550e8400-e29b-41d4-a716-446655440000";
+    private static final String START    = "2026-11-01T10:00:00Z";
+    private static final String END      = "2026-11-01T11:00:00Z";
 
     private AppointmentService service;
 
-    private static final String PROVIDER_ID  = "550e8400-e29b-41d4-a716-446655440000";
-    private static final String START_TIME   = "2026-11-01T10:00:00Z";
-    private static final String END_TIME     = "2026-11-01T11:00:00Z";
-
     @BeforeEach
     void setUp() {
-        // Make the transaction manager execute lambdas synchronously (no real DB).
-        // lenient() avoids UnnecessaryStubbingException for tests that don't trigger commit/rollback.
+        // Wire a synchronous, no-op transaction manager so lambdas run inline.
+        // lenient() suppresses UnnecessaryStubbingException for tests that
+        // short-circuit before commit/rollback (e.g., validation-only tests).
         TransactionStatus status = new SimpleTransactionStatus();
-        lenient().when(transactionManager.getTransaction(any(TransactionDefinition.class))).thenReturn(status);
-        lenient().doNothing().when(transactionManager).commit(status);
-        lenient().doNothing().when(transactionManager).rollback(status);
+        lenient().when(txManager.getTransaction(any(TransactionDefinition.class))).thenReturn(status);
+        lenient().doNothing().when(txManager).commit(status);
+        lenient().doNothing().when(txManager).rollback(status);
 
-        service = new AppointmentService(repository, validator, fixedClock, transactionManager);
+        service = new AppointmentService(repository, new AppointmentInputValidator(), CLOCK, txManager);
     }
 
     // ── book() ─────────────────────────────────────────────────────────────────
 
-    @Test
-    void book_noOverlap_savesAndReturnsDetails() {
-        when(repository.hasActiveOverlap(any(), any(), any())).thenReturn(false);
-        when(repository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+    @Nested
+    class Book {
 
-        AppointmentDetails result = service.book(PROVIDER_ID, START_TIME, END_TIME);
+        @Test
+        void noOverlap_savesAppointment_returnsActiveDetails() {
+            when(repository.hasActiveOverlap(any(), any(), any())).thenReturn(false);
+            when(repository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        assertThat(result.status()).isEqualTo(AppointmentStatus.ACTIVE);
-        assertThat(result.providerId()).isEqualTo(UUID.fromString(PROVIDER_ID));
-        assertThat(result.startTime()).isEqualTo(Instant.parse(START_TIME));
-        assertThat(result.endTime()).isEqualTo(Instant.parse(END_TIME));
-        assertThat(result.createdAt()).isEqualTo(fixedClock.instant());
-        assertThat(result.cancelledAt()).isNull();
-        verify(repository).saveAndFlush(any(Appointment.class));
-    }
+            AppointmentDetails result = service.book(PROVIDER, START, END);
 
-    @Test
-    void book_overlapDetectedByQuery_throwsConflict() {
-        when(repository.hasActiveOverlap(any(), any(), any())).thenReturn(true);
+            assertThat(result.status()).isEqualTo(AppointmentStatus.ACTIVE);
+            assertThat(result.providerId()).isEqualTo(UUID.fromString(PROVIDER));
+            assertThat(result.startTime()).isEqualTo(Instant.parse(START));
+            assertThat(result.endTime()).isEqualTo(Instant.parse(END));
+            assertThat(result.createdAt()).isEqualTo(CLOCK.instant());
+            assertThat(result.cancelledAt()).isNull();
+            verify(repository).saveAndFlush(any(Appointment.class));
+        }
 
-        assertThatThrownBy(() -> service.book(PROVIDER_ID, START_TIME, END_TIME))
-                .isInstanceOf(AppointmentConflictException.class);
+        // ── Overlap detection — early-read guard path ──────────────────────────
 
-        verify(repository, never()).saveAndFlush(any());
-    }
+        @Test
+        void overlap_earlyGuardFires_throwsConflict_noSave() {
+            // hasActiveOverlap returns true → conflict detected before even trying to save
+            when(repository.hasActiveOverlap(any(), any(), any())).thenReturn(true);
 
-    @Test
-    void book_invalidProviderId_throwsBeforeTransaction() {
-        assertThatThrownBy(() -> service.book("bad-id", START_TIME, END_TIME))
-                .isInstanceOf(com.example.scheduler.domain.InvalidAppointmentException.class);
+            assertThatThrownBy(() -> service.book(PROVIDER, START, END))
+                    .isInstanceOf(AppointmentConflictException.class)
+                    .satisfies(ex -> assertThat(((AppointmentConflictException) ex).code())
+                            .isEqualTo("APPOINTMENT_CONFLICT"));
 
-        verifyNoInteractions(repository);
-    }
+            verify(repository, never()).saveAndFlush(any());
+        }
 
-    @Test
-    void book_endBeforeStart_throwsBeforeTransaction() {
-        assertThatThrownBy(() -> service.book(PROVIDER_ID, END_TIME, START_TIME))
-                .isInstanceOf(com.example.scheduler.domain.InvalidAppointmentException.class);
+        // ── Overlap detection — exclusion constraint path (race condition) ─────
 
-        verifyNoInteractions(repository);
+        @Test
+        void overlap_exclusionConstraintFired_translatedToConflict() {
+            // Early guard passes (no overlap visible yet), but two concurrent
+            // requests race; the DB exclusion constraint rejects the second one.
+            when(repository.hasActiveOverlap(any(), any(), any())).thenReturn(false);
+
+            SQLException sqlEx = new SQLException("exclusion constraint violated", "23P01");
+            ConstraintViolationException cve = new ConstraintViolationException(
+                    "conflict", sqlEx, "appointments_no_active_overlap");
+            when(repository.saveAndFlush(any()))
+                    .thenThrow(new DataIntegrityViolationException("constraint", cve));
+
+            assertThatThrownBy(() -> service.book(PROVIDER, START, END))
+                    .isInstanceOf(AppointmentConflictException.class);
+        }
+
+        @Test
+        void overlap_exclusionConstraintWithNullName_translatedToConflict() {
+            // Constraint name may be null on some JDBC drivers; code must still match on SQLState alone.
+            when(repository.hasActiveOverlap(any(), any(), any())).thenReturn(false);
+
+            SQLException sqlEx = new SQLException("exclusion constraint violated", "23P01");
+            ConstraintViolationException cve = new ConstraintViolationException("conflict", sqlEx, null);
+            when(repository.saveAndFlush(any()))
+                    .thenThrow(new DataIntegrityViolationException("constraint", cve));
+
+            assertThatThrownBy(() -> service.book(PROVIDER, START, END))
+                    .isInstanceOf(AppointmentConflictException.class);
+        }
+
+        @Test
+        void overlap_unrelatedConstraintViolation_rethrown() {
+            // SQLState 23505 is a unique violation — unrelated to our exclusion constraint.
+            when(repository.hasActiveOverlap(any(), any(), any())).thenReturn(false);
+
+            SQLException sqlEx = new SQLException("unique violation", "23505");
+            ConstraintViolationException cve = new ConstraintViolationException("other", sqlEx, "some_other_constraint");
+            RuntimeException ex = new DataIntegrityViolationException("other constraint", cve);
+            when(repository.saveAndFlush(any())).thenThrow(ex);
+
+            assertThatThrownBy(() -> service.book(PROVIDER, START, END))
+                    .isSameAs(ex); // must NOT be translated to AppointmentConflictException
+        }
+
+        // ── Validation fires before any repository call ────────────────────────
+
+        @Test
+        void invalidProviderId_throwsBeforeRepository() {
+            assertThatThrownBy(() -> service.book("bad-id", START, END))
+                    .isInstanceOf(InvalidAppointmentException.class);
+            verifyNoInteractions(repository);
+        }
+
+        @Test
+        void endBeforeStart_throwsBeforeRepository() {
+            assertThatThrownBy(() -> service.book(PROVIDER, END, START))
+                    .isInstanceOf(InvalidAppointmentException.class);
+            verifyNoInteractions(repository);
+        }
+
+        @Test
+        void endEqualsStart_throwsBeforeRepository() {
+            assertThatThrownBy(() -> service.book(PROVIDER, START, START))
+                    .isInstanceOf(InvalidAppointmentException.class);
+            verifyNoInteractions(repository);
+        }
     }
 
     // ── cancel() ───────────────────────────────────────────────────────────────
 
-    @Test
-    void cancel_activeAppointment_cancelsAndReturnsDetails() {
-        UUID id = UUID.randomUUID();
-        Appointment appointment = Appointment.create(
-                UUID.fromString(PROVIDER_ID),
-                Instant.parse(START_TIME), Instant.parse(END_TIME),
-                fixedClock.instant());
+    @Nested
+    class Cancel {
 
-        when(repository.findById(id)).thenReturn(Optional.of(appointment));
-        doNothing().when(repository).flush();
+        @Test
+        void activeAppointment_cancelledSuccessfully_returnsDetails() {
+            UUID id = UUID.randomUUID();
+            Appointment appt = freshActive();
+            when(repository.findById(id)).thenReturn(Optional.of(appt));
+            doNothing().when(repository).flush();
 
-        AppointmentDetails result = service.cancel(id.toString());
+            AppointmentDetails result = service.cancel(id.toString());
 
-        assertThat(result.status()).isEqualTo(AppointmentStatus.CANCELLED);
-        assertThat(result.cancelledAt()).isEqualTo(fixedClock.instant());
+            assertThat(result.status()).isEqualTo(AppointmentStatus.CANCELLED);
+            assertThat(result.cancelledAt()).isEqualTo(CLOCK.instant());
+        }
+
+        @Test
+        void missingAppointment_throwsNotFound() {
+            UUID id = UUID.randomUUID();
+            when(repository.findById(id)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.cancel(id.toString()))
+                    .isInstanceOf(AppointmentNotFoundException.class);
+        }
+
+        @Test
+        void alreadyCancelledAppointment_throwsAlreadyCancelled() {
+            UUID id = UUID.randomUUID();
+            Appointment appt = freshActive();
+            appt.cancel(CLOCK.instant());
+            when(repository.findById(id)).thenReturn(Optional.of(appt));
+
+            assertThatThrownBy(() -> service.cancel(id.toString()))
+                    .isInstanceOf(AlreadyCancelledException.class);
+        }
+
+        // ── Optimistic-lock recovery paths ─────────────────────────────────────
+
+        @Test
+        void optimisticLock_recoveryReadShowsCancelled_throwsAlreadyCancelled() {
+            UUID id = UUID.randomUUID();
+            Appointment cancelledAppt = freshActive();
+            cancelledAppt.cancel(CLOCK.instant());
+
+            when(repository.findById(id))
+                    .thenReturn(Optional.of(freshActive()))      // first read — ACTIVE
+                    .thenReturn(Optional.of(cancelledAppt));     // recovery read — CANCELLED
+            doThrow(new OptimisticLockingFailureException("stale")).when(repository).flush();
+
+            assertThatThrownBy(() -> service.cancel(id.toString()))
+                    .isInstanceOf(AlreadyCancelledException.class);
+        }
+
+        @Test
+        void optimisticLock_recoveryReadShowsGone_throwsNotFound() {
+            UUID id = UUID.randomUUID();
+
+            when(repository.findById(id))
+                    .thenReturn(Optional.of(freshActive()))  // first read
+                    .thenReturn(Optional.empty());           // recovery read — row gone
+            doThrow(new OptimisticLockingFailureException("stale")).when(repository).flush();
+
+            assertThatThrownBy(() -> service.cancel(id.toString()))
+                    .isInstanceOf(AppointmentNotFoundException.class);
+        }
+
+        @Test
+        void optimisticLock_recoveryReadShowsStillActive_throwsConcurrentModification() {
+            UUID id = UUID.randomUUID();
+
+            // Both reads must return independent instances; the first instance gets
+            // mutated by cancel() before the flush throws, so the second must be fresh.
+            when(repository.findById(id))
+                    .thenAnswer(inv -> Optional.of(freshActive()))
+                    .thenAnswer(inv -> Optional.of(freshActive()));
+            doThrow(new OptimisticLockingFailureException("stale")).when(repository).flush();
+
+            assertThatThrownBy(() -> service.cancel(id.toString()))
+                    .isInstanceOf(ConcurrentAppointmentModificationException.class);
+        }
+
+        // ── Validation fires before any repository call ────────────────────────
+
+        @Test
+        void invalidId_throwsBeforeRepository() {
+            assertThatThrownBy(() -> service.cancel("not-a-uuid"))
+                    .isInstanceOf(InvalidAppointmentException.class);
+            verifyNoInteractions(repository);
+        }
     }
 
-    @Test
-    void cancel_notFound_throwsNotFoundException() {
-        UUID id = UUID.randomUUID();
-        when(repository.findById(id)).thenReturn(Optional.empty());
+    // ── helpers ───────────────────────────────────────────────────────────────
 
-        assertThatThrownBy(() -> service.cancel(id.toString()))
-                .isInstanceOf(AppointmentNotFoundException.class);
-    }
-
-    @Test
-    void cancel_alreadyCancelled_throwsAlreadyCancelledException() {
-        UUID id = UUID.randomUUID();
-        Appointment appointment = Appointment.create(
-                UUID.fromString(PROVIDER_ID),
-                Instant.parse(START_TIME), Instant.parse(END_TIME),
-                fixedClock.instant());
-        appointment.cancel(fixedClock.instant());
-
-        when(repository.findById(id)).thenReturn(Optional.of(appointment));
-
-        assertThatThrownBy(() -> service.cancel(id.toString()))
-                .isInstanceOf(AlreadyCancelledException.class);
-    }
-
-    @Test
-    void cancel_optimisticLockFailure_andCurrentlyCancelled_throwsAlreadyCancelled() {
-        UUID id = UUID.randomUUID();
-        Appointment cancelledAppointment = Appointment.create(
-                UUID.fromString(PROVIDER_ID),
-                Instant.parse(START_TIME), Instant.parse(END_TIME),
-                fixedClock.instant());
-        cancelledAppointment.cancel(fixedClock.instant());
-
-        // First call throws optimistic lock; second (recovery) returns cancelled.
-        when(repository.findById(id))
-                .thenReturn(Optional.of(Appointment.create(
-                        UUID.fromString(PROVIDER_ID),
-                        Instant.parse(START_TIME), Instant.parse(END_TIME),
-                        fixedClock.instant())))
-                .thenReturn(Optional.of(cancelledAppointment));
-        doThrow(new OptimisticLockingFailureException("stale")).when(repository).flush();
-
-        assertThatThrownBy(() -> service.cancel(id.toString()))
-                .isInstanceOf(AlreadyCancelledException.class);
-    }
-
-    @Test
-    void cancel_optimisticLockFailure_andAppointmentDisappeared_throwsNotFound() {
-        UUID id = UUID.randomUUID();
-
-        when(repository.findById(id))
-                .thenReturn(Optional.of(Appointment.create(
-                        UUID.fromString(PROVIDER_ID),
-                        Instant.parse(START_TIME), Instant.parse(END_TIME),
-                        fixedClock.instant())))
-                .thenReturn(Optional.empty()); // Gone after rollback
-        doThrow(new OptimisticLockingFailureException("stale")).when(repository).flush();
-
-        assertThatThrownBy(() -> service.cancel(id.toString()))
-                .isInstanceOf(AppointmentNotFoundException.class);
-    }
-
-    @Test
-    void cancel_optimisticLockFailure_andStillActive_throwsConcurrentModification() {
-        UUID id = UUID.randomUUID();
-
-        // Return a fresh ACTIVE appointment each time (different object instances).
-        when(repository.findById(id))
-                .thenAnswer(inv -> Optional.of(Appointment.create(
-                        UUID.fromString(PROVIDER_ID),
-                        Instant.parse(START_TIME), Instant.parse(END_TIME),
-                        fixedClock.instant())))
-                .thenAnswer(inv -> Optional.of(Appointment.create(
-                        UUID.fromString(PROVIDER_ID),
-                        Instant.parse(START_TIME), Instant.parse(END_TIME),
-                        fixedClock.instant())));
-        doThrow(new OptimisticLockingFailureException("stale")).when(repository).flush();
-
-        assertThatThrownBy(() -> service.cancel(id.toString()))
-                .isInstanceOf(ConcurrentAppointmentModificationException.class);
-    }
-
-    @Test
-    void cancel_invalidId_throwsBeforeTransaction() {
-        assertThatThrownBy(() -> service.cancel("not-a-uuid"))
-                .isInstanceOf(com.example.scheduler.domain.InvalidAppointmentException.class);
-
-        verifyNoInteractions(repository);
+    private static Appointment freshActive() {
+        return Appointment.create(
+                UUID.fromString(PROVIDER),
+                Instant.parse(START), Instant.parse(END),
+                CLOCK.instant());
     }
 }
