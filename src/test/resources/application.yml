@@ -1,13 +1,6 @@
-# Test configuration — uses the same local PostgreSQL as the main application
+# Test datasource is provided dynamically by @ServiceConnection (Testcontainers).
+# Only non-datasource properties are listed here.
 spring:
-  datasource:
-    url: jdbc:postgresql://localhost:5432/scheduler
-    username: postgres
-    password: root
-    driver-class-name: org.postgresql.Driver
-    hikari:
-      connection-init-sql: SET TIME ZONE 'UTC'
-
   jpa:
     open-in-view: false
     hibernate:
@@ -22,8 +15,8 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
-    baseline-on-migrate: true
-    baseline-version: 0
+    # Fresh Testcontainers DB has no pre-existing tables — no baseline needed.
+    baseline-on-migrate: false
 
   jackson:
     time-zone: UTC
