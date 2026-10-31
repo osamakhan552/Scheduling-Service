@@ -34,9 +34,7 @@ public class AppointmentService {
         this.repository = repository;
         this.validator = validator;
         this.clock = clock;
-        this.transactions = new TransactionTemplate(transactionManager);
-        this.transactions.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
-        this.transactions.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        this.transactions = buildTransactionTemplate(transactionManager);
     }
 
     public AppointmentDetails book(String providerId, String startTime, String endTime) {
@@ -55,9 +53,7 @@ public class AppointmentService {
             });
         } catch (RuntimeException ex) {
             // The transaction has ended (rolled back) before classifying the SQL failure.
-            if (isBookingExclusionViolation(ex)) {
-                throw new AppointmentConflictException();
-            }
+            if (isBookingExclusionViolation(ex)) throw new AppointmentConflictException();
             throw ex;
         }
     }
@@ -76,21 +72,23 @@ public class AppointmentService {
                 return appointment.details();
             });
         } catch (RuntimeException ex) {
-            if (!isOptimisticFailure(ex)) {
-                throw ex;
-            }
+            if (!isOptimisticFailure(ex)) throw ex;
             // Do not query the aborted transaction. Read fresh state in a new transaction.
-            AppointmentStatus current = transactions.execute(status -> repository.findById(id)
-                    .map(Appointment::getStatus)
-                    .orElse(null));
-            if (current == null) {
-                throw new AppointmentNotFoundException();
-            }
-            if (current == AppointmentStatus.CANCELLED) {
-                throw new AlreadyCancelledException();
-            }
+            AppointmentStatus current = transactions.execute(
+                    status -> repository.findById(id).map(Appointment::getStatus).orElse(null));
+            if (current == null) throw new AppointmentNotFoundException();
+            if (current == AppointmentStatus.CANCELLED) throw new AlreadyCancelledException();
             throw new ConcurrentAppointmentModificationException();
         }
+    }
+
+    // --- helpers ---
+
+    private static TransactionTemplate buildTransactionTemplate(PlatformTransactionManager mgr) {
+        TransactionTemplate t = new TransactionTemplate(mgr);
+        t.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        t.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        return t;
     }
 
     private static boolean isBookingExclusionViolation(Throwable error) {
@@ -104,7 +102,7 @@ public class AppointmentService {
                 constraintName = violation.getConstraintName();
             }
         }
-        // The name, when available, must match our specific booking constraint.
+        // The constraint name, when available, must match our specific booking constraint.
         return sqlStateMatched && (constraintName == null || EXCLUSION_CONSTRAINT.equals(constraintName));
     }
 
